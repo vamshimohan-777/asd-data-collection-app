@@ -1,0 +1,52 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Repo-local caches/temp
+.npm-cache/
+.gradle-home/
+.tmp-test/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+backend/.venv/
+
+# Backend generated capture artifacts
+backend/data/raw_json/
+backend/data/raw_pth/
+backend/data/processed_pth/
+backend/data/renders/
+
+# Node / Expo / React Native
+mobile/node_modules/
+mobile/.expo/
+mobile/ios/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/.cxx/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/captures/
