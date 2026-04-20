@@ -21,6 +21,7 @@ pnpm-debug.log*
 .npm-cache/
 .gradle-home/
 .tmp-test/
+.gradle-cache/
 
 # Python
 __pycache__/
@@ -35,6 +36,7 @@ venv/
 backend/.venv/
 
 # Backend generated capture artifacts
+backend/data/
 backend/data/raw_json/
 backend/data/raw_pth/
 backend/data/processed_pth/

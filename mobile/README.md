@@ -7,7 +7,7 @@ This app captures camera frames with `react-native-vision-camera`, runs a frame 
 ```bash
 npm install
 npx expo prebuild
-npx expo run:android   # or npx expo run:ios
+npx expo run:android --all-arch   # or npx expo run:ios
 npm run start
 ```
 
@@ -31,7 +31,7 @@ Dependency included:
 
 - `react-native-vision-camera-mlkit`
 
-After dependency changes, rebuild the development app (`npx expo run:android` / `npx expo run:ios`).
+After dependency changes, rebuild the development app (`npx expo run:android --all-arch` / `npx expo run:ios`).
 
 ## MediaPipe Native TODO
 

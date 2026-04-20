@@ -5,7 +5,7 @@
   "main": "expo/AppEntry.js",
   "scripts": {
     "start": "expo start --dev-client",
-    "android": "expo run:android",
+    "android": "expo run:android --all-arch",
     "ios": "expo run:ios",
     "prebuild": "expo prebuild"
   },

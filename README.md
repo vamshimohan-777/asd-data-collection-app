@@ -52,7 +52,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 cd mobile
 npm install
 npx expo prebuild
-npx expo run:android   # or: npx expo run:ios
+npx expo run:android --all-arch   # or: npx expo run:ios
 npm run start
 ```
 

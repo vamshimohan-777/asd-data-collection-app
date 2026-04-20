@@ -927,6 +927,29 @@ function Get-JavaHomeInfo {
     return $null
 }
 
+function Ensure-AndroidGradleArchitectures {
+    param([Parameter(Mandatory = $true)][string]$MobileDir)
+
+    $gradlePropsPath = Join-Path $MobileDir "android\gradle.properties"
+    if (-not (Test-Path -LiteralPath $gradlePropsPath)) {
+        Write-Host "Android gradle.properties not found yet (skip architecture patch)." -ForegroundColor DarkYellow
+        return
+    }
+
+    $content = Get-Content -LiteralPath $gradlePropsPath -Raw
+    $desiredLine = "reactNativeArchitectures=arm64-v8a,x86_64"
+    $updated = [regex]::Replace(
+        $content,
+        "(?m)^reactNativeArchitectures=.*$",
+        $desiredLine
+    )
+
+    if ($updated -ne $content) {
+        Set-Content -LiteralPath $gradlePropsPath -Value $updated -NoNewline
+        Write-Host "Patched Android architectures to arm64-v8a,x86_64." -ForegroundColor Cyan
+    }
+}
+
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $backendDir = Join-Path $repoRoot "backend"
 $mobileDir = Join-Path $repoRoot "mobile"
@@ -1011,6 +1034,10 @@ if (-not $SkipInstall) {
 }
 
 if ($runPlatform -eq "android") {
+    Ensure-AndroidGradleArchitectures -MobileDir $mobileDir
+}
+
+if ($runPlatform -eq "android") {
     Ensure-AndroidPoseDetectorPlugin -MobileDir $mobileDir
 }
 
@@ -1060,10 +1087,16 @@ cmd /c npm run start
 }
 else {
     Write-Host "Starting Expo native run for platform '$runPlatform'..." -ForegroundColor Green
+    $expoRunCommand = if ($runPlatform -eq "android") {
+        "cmd /c npx expo run:android --all-arch"
+    }
+    else {
+        "cmd /c npx expo run:$runPlatform"
+    }
     $mobileCommand = @"
 Set-Location -LiteralPath '$mobileDir'
 $androidEnvBootstrap
-cmd /c npx expo run:$runPlatform
+$expoRunCommand
 "@
     Start-DetachedPowerShell -Command $mobileCommand -Title "Pose Mobile ($runPlatform)"
 }

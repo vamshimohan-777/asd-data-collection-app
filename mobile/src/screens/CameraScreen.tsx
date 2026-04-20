@@ -30,7 +30,7 @@ import {
 } from "react-native-vision-camera";
 
 import { PoseOverlay } from "../components/PoseOverlay";
-import { DEFAULT_BACKEND_URL, NOMINAL_FPS } from "../config";
+import { DEFAULT_BACKEND_URL, NOMINAL_FPS, PRECHECK_FPS } from "../config";
 import { usePoseRecorder } from "../hooks/usePoseRecorder";
 import {
   getNativePoseDetectorName,
@@ -45,6 +45,8 @@ interface ReviewInfo {
   framesCaptured: number;
   durationMs: number;
 }
+
+const READINESS_HOLD_MS = 150;
 
 const GENDER_OPTIONS: Array<{ value: ParticipantGender; label: string }> = [
   { value: "male", label: "Male" },
@@ -143,6 +145,7 @@ export function CameraScreen(): React.ReactElement {
   const [deviceScanError, setDeviceScanError] = useState<string | null>(null);
   const [reviewInfo, setReviewInfo] = useState<ReviewInfo | null>(null);
   const [isFinalizing, setIsFinalizing] = useState(false);
+  const [isReadinessStable, setIsReadinessStable] = useState(false);
 
   const cameraRef = useRef<Camera>(null);
   const pulse = useSharedValue(1);
@@ -212,17 +215,19 @@ export function CameraScreen(): React.ReactElement {
     );
   }, []);
 
+  const targetFps = flowStep === "recording" ? NOMINAL_FPS : PRECHECK_FPS;
+
   const format = useMemo(
-    () => pickBestCameraFormat(device, NOMINAL_FPS),
-    [device]
+    () => pickBestCameraFormat(device, targetFps),
+    [device, targetFps]
   );
 
   const selectedFps = useMemo(() => {
     if (!format) {
-      return NOMINAL_FPS;
+      return targetFps;
     }
-    return Math.max(format.minFps, Math.min(NOMINAL_FPS, format.maxFps));
-  }, [format]);
+    return Math.max(format.minFps, Math.min(targetFps, format.maxFps));
+  }, [format, targetFps]);
 
   const selectedFormatResolution = useMemo<[number, number]>(() => {
     if (!format) {
@@ -284,6 +289,7 @@ export function CameraScreen(): React.ReactElement {
     () => evaluateCaptureReadiness(recorder.latestKeypoints, nativePoseDetectorReady),
     [nativePoseDetectorReady, recorder.latestKeypoints]
   );
+  const canStartRecording = readiness.ready && isReadinessStable;
 
   const requiresCamera = flowStep === "testing" || flowStep === "recording";
   const cameraIsActive = isAppActive && requiresCamera;
@@ -345,6 +351,24 @@ export function CameraScreen(): React.ReactElement {
     }
   }, [recorder.isRecording, pulse]);
 
+  useEffect(() => {
+    if (flowStep !== "testing") {
+      setIsReadinessStable(false);
+      return;
+    }
+
+    if (!readiness.ready) {
+      setIsReadinessStable(false);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setIsReadinessStable(true);
+    }, READINESS_HOLD_MS);
+
+    return () => clearTimeout(timer);
+  }, [flowStep, readiness.ready]);
+
   const stopButtonAnimatedStyle = useAnimatedStyle(() => ({
     transform: [{ scale: pulse.value }]
   }));
@@ -361,6 +385,9 @@ export function CameraScreen(): React.ReactElement {
   };
 
   const onStartRecording = (): void => {
+    if (!canStartRecording) {
+      return;
+    }
     setReviewInfo(null);
     if (recorder.hasStoppedRecording) {
       recorder.discardStoppedRecording();
@@ -689,14 +716,19 @@ export function CameraScreen(): React.ReactElement {
         <Text style={[styles.checkSummary, readiness.ready ? styles.checkOk : styles.checkFail]}>
           {readiness.summary}
         </Text>
+        {readiness.ready && !isReadinessStable ? (
+          <Text style={styles.subtle}>
+            Hold still for a moment so detection can stabilize before recording.
+          </Text>
+        ) : null}
         <View style={styles.inlineRow}>
           <Pressable style={styles.secondaryButton} onPress={() => setFlowStep("home")}>
             <Text style={styles.secondaryButtonText}>Back</Text>
           </Pressable>
           <Pressable
-            style={[styles.primaryButton, !readiness.ready && styles.disabledButton]}
+            style={[styles.primaryButton, !canStartRecording && styles.disabledButton]}
             onPress={onStartRecording}
-            disabled={!readiness.ready}
+            disabled={!canStartRecording}
           >
             <Text style={styles.primaryButtonText}>Start Recording</Text>
           </Pressable>

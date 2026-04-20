@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -29,6 +30,58 @@ def _sorted_unique_timestamps(
     unique_ts, unique_indices = np.unique(sorted_ts, return_index=True)
     unique_keypoints = sorted_keypoints[unique_indices]
     return unique_keypoints, unique_ts
+
+
+def infer_timestamp_scale_to_ms(timestamps: np.ndarray, target_fps: float) -> float:
+    finite = timestamps[np.isfinite(timestamps)]
+    if finite.shape[0] == 0:
+        return 1.0
+
+    candidate_scales = np.array([1.0, 1e-3, 1e-6, 1000.0], dtype=np.float64)
+
+    # Prefer candidates that look like wall-clock epoch milliseconds.
+    sample_ts = float(finite[0])
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000.0
+    epoch_window_ms = 24.0 * 60.0 * 60.0 * 1000.0
+    epoch_matches: list[float] = []
+    for scale in candidate_scales:
+        scaled = sample_ts * float(scale)
+        if np.isfinite(scaled) and abs(scaled - now_ms) <= epoch_window_ms:
+            epoch_matches.append(float(scale))
+    if len(epoch_matches) == 1:
+        return epoch_matches[0]
+
+    if finite.shape[0] < 2:
+        return 1.0
+
+    sorted_ts = np.sort(finite.astype(np.float64, copy=False))
+    deltas = np.diff(sorted_ts)
+    positive_deltas = deltas[deltas > 0]
+    if positive_deltas.shape[0] == 0:
+        return 1.0
+
+    median_delta = float(np.median(positive_deltas))
+    if median_delta <= 0:
+        return 1.0
+
+    expected_delta_ms = 1000.0 / max(float(target_fps), 1e-6)
+    best_scale = 1.0
+    best_score = float("inf")
+
+    for scale in candidate_scales:
+        scaled_delta_ms = median_delta * float(scale)
+        if not np.isfinite(scaled_delta_ms) or scaled_delta_ms <= 0:
+            continue
+
+        score = abs(np.log(scaled_delta_ms / expected_delta_ms))
+        if scaled_delta_ms < 0.1 or scaled_delta_ms > 10000.0:
+            score += 5.0
+
+        if score < best_score:
+            best_score = float(score)
+            best_scale = float(scale)
+
+    return best_scale
 
 
 def resample_keypoints(
@@ -139,9 +192,11 @@ def preprocess_pose_capture(
 ) -> PipelineResult:
     keypoints_np = np.asarray(keypoints, dtype=np.float32)
     timestamps_np = np.asarray(timestamps, dtype=np.float64)
+    timestamp_scale_to_ms = infer_timestamp_scale_to_ms(timestamps_np, config.target_fps)
+    timestamps_ms = timestamps_np * timestamp_scale_to_ms
 
     resampled_keypoints, resampled_timestamps = resample_keypoints(
-        keypoints_np, timestamps_np, config.target_fps
+        keypoints_np, timestamps_ms, config.target_fps
     )
     smoothed_keypoints = exponential_smoothing(resampled_keypoints, config.smoothing_alpha)
     normalized_keypoints = normalize_skeleton(smoothed_keypoints)
@@ -154,7 +209,8 @@ def preprocess_pose_capture(
         "frames_out": int(filled_keypoints.shape[0]),
         "target_fps": float(config.target_fps),
         "smoothing_alpha": float(config.smoothing_alpha),
-        "visibility_threshold": float(config.visibility_threshold)
+        "visibility_threshold": float(config.visibility_threshold),
+        "timestamp_scale_to_ms": float(timestamp_scale_to_ms),
     }
 
     return PipelineResult(

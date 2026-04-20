@@ -11,6 +11,12 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from .landmarks25 import (
+    CUSTOM_25_CSV_COLUMNS,
+    CUSTOM_25_MAPPING_METADATA,
+    convert_33_to_custom_25,
+    flatten_custom_25_for_csv,
+)
 from .pipeline import PipelineConfig, preprocess_pose_capture
 from .render import render_skeleton_video
 from .schemas import UploadPayload
@@ -22,8 +28,19 @@ RAW_JSON_DIR = DATA_DIR / "raw_json"
 RAW_PTH_DIR = DATA_DIR / "raw_pth"
 PROCESSED_PTH_DIR = DATA_DIR / "processed_pth"
 RENDER_DIR = DATA_DIR / "renders"
+PROCESSED_25_CSV_DIR = DATA_DIR / "processed_25_csv"
+PROCESSED_25_NPY_DIR = DATA_DIR / "processed_25_npy"
+PROCESSED_25_META_DIR = DATA_DIR / "processed_25_meta"
 
-for folder in [RAW_JSON_DIR, RAW_PTH_DIR, PROCESSED_PTH_DIR, RENDER_DIR]:
+for folder in [
+    RAW_JSON_DIR,
+    RAW_PTH_DIR,
+    PROCESSED_PTH_DIR,
+    RENDER_DIR,
+    PROCESSED_25_CSV_DIR,
+    PROCESSED_25_NPY_DIR,
+    PROCESSED_25_META_DIR,
+]:
     folder.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Pose Capture Backend", version="0.1.0")
@@ -62,6 +79,9 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
     raw_pth_path = RAW_PTH_DIR / f"{capture_id}.pth"
     processed_pth_path = PROCESSED_PTH_DIR / f"{capture_id}.pth"
     render_path = RENDER_DIR / f"{capture_id}.mp4"
+    processed_25_csv_path = PROCESSED_25_CSV_DIR / f"{capture_id}.csv"
+    processed_25_npy_path = PROCESSED_25_NPY_DIR / f"{capture_id}.npy"
+    processed_25_meta_path = PROCESSED_25_META_DIR / f"{capture_id}.json"
 
     try:
         keypoints_np = np.asarray(payload.keypoints, dtype=np.float32)
@@ -103,6 +123,60 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
     )
 
     try:
+        keypoints_25 = convert_33_to_custom_25(keypoints_np, invert_xy=True)
+        keypoints_25_flat = flatten_custom_25_for_csv(keypoints_25)
+
+        np.save(processed_25_npy_path, keypoints_25.astype(np.float32))
+        np.savetxt(
+            processed_25_csv_path,
+            keypoints_25_flat,
+            delimiter=",",
+            header=",".join(CUSTOM_25_CSV_COLUMNS),
+            comments="",
+        )
+
+        timestamps_start = (
+            float(timestamps_np[0]) if timestamps_np.shape[0] > 0 else None
+        )
+        timestamps_end = (
+            float(timestamps_np[-1]) if timestamps_np.shape[0] > 0 else None
+        )
+        conversion_meta = {
+            "capture_id": capture_id,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source": {
+                "type": "raw_mobile_upload",
+                "keypoints_shape": list(keypoints_np.shape),
+                "timestamps_shape": list(timestamps_np.shape),
+                "timestamps_start_raw": timestamps_start,
+                "timestamps_end_raw": timestamps_end,
+                "raw_json_path": str(raw_json_path),
+                "raw_pth_path": str(raw_pth_path),
+            },
+            "conversion": {
+                "name": "raw_mediapipe33_to_custom25",
+                "xy_sign_inverted": True,
+                "target_shape": list(keypoints_25.shape),
+                "csv_columns": CUSTOM_25_CSV_COLUMNS,
+                "mapping": CUSTOM_25_MAPPING_METADATA,
+            },
+            "capture_meta": payload.meta.model_dump(),
+            "files": {
+                "csv_path": str(processed_25_csv_path),
+                "npy_path": str(processed_25_npy_path),
+            },
+        }
+        processed_25_meta_path.write_text(
+            json.dumps(conversion_meta, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Custom 25-landmark export failed: {exc}",
+        ) from exc
+
+    try:
         render_skeleton_video(
             keypoints=processed.keypoints,
             output_path=render_path,
@@ -119,6 +193,9 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
         "raw_pth_path": str(raw_pth_path),
         "processed_pth_path": str(processed_pth_path),
         "render_path": str(render_path),
+        "processed_25_csv_path": str(processed_25_csv_path),
+        "processed_25_npy_path": str(processed_25_npy_path),
+        "processed_25_meta_path": str(processed_25_meta_path),
         "frames_in": int(keypoints_np.shape[0]),
         "frames_out": int(processed.keypoints.shape[0]),
     }

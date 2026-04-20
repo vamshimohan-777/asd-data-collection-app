@@ -47,6 +47,9 @@ Saved under `backend/data/`:
 - `raw_pth/*.pth`
 - `processed_pth/*.pth`
 - `renders/*.mp4`
+- `processed_25_csv/*.csv` (custom 25-landmark flattened XYZ columns from raw mobile upload)
+- `processed_25_npy/*.npy` (shape `[T, 25, 3]` from raw mobile upload)
+- `processed_25_meta/*.json` (raw-source conversion + capture metadata)
 
 ## Render Existing `.pth`
 

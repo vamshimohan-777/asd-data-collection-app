@@ -12,6 +12,7 @@ import type {
   PoseUploadResponse
 } from "../types/pose";
 import { uploadCapture } from "../utils/api";
+import { isLikelyHumanPose } from "../utils/quality";
 import {
   countPendingCaptures,
   listPendingCaptureIds,
@@ -70,20 +71,42 @@ const EMPTY_STATS: RecorderStats = {
   durationMs: 0
 };
 
+const MIN_VALID_POSE_STREAK = 6;
+const MAX_INVALID_POSE_STREAK = 1;
+const PREVIEW_EMIT_EVERY_N_VALID_FRAMES = 2;
+const STALE_POSE_CLEAR_MS = 300;
+const STALE_CHECK_INTERVAL_MS = 120;
+
 function normalizeTimestampMs(rawValue: number, fallbackMs: number): number {
   if (!Number.isFinite(rawValue) || rawValue <= 0) {
     return fallbackMs;
   }
-  if (rawValue > 1e14) {
-    return rawValue / 1e6;
+
+  // VisionCamera timestamps can be seconds/ms/us/ns depending on platform/runtime.
+  // Prefer whichever conversion is close to wall-clock time; otherwise fall back to Date.now().
+  const candidates = [
+    rawValue,
+    rawValue / 1e3,
+    rawValue / 1e6,
+    rawValue * 1e3
+  ];
+
+  let best = fallbackMs;
+  let bestOffset = Number.POSITIVE_INFINITY;
+
+  for (const candidate of candidates) {
+    if (!Number.isFinite(candidate) || candidate <= 0) {
+      continue;
+    }
+    const offset = Math.abs(candidate - fallbackMs);
+    if (offset < bestOffset) {
+      best = candidate;
+      bestOffset = offset;
+    }
   }
-  if (rawValue > 1e11) {
-    return rawValue / 1e3;
-  }
-  if (rawValue > 1e6) {
-    return rawValue;
-  }
-  return rawValue * 1000;
+
+  const oneDayMs = 24 * 60 * 60 * 1000;
+  return bestOffset <= oneDayMs ? best : fallbackMs;
 }
 
 function normalizeResolution(
@@ -134,6 +157,8 @@ export function usePoseRecorder(config: RecorderConfig): {
   const droppedFrameRef = useRef(0);
   const stoppedPayloadRef = useRef<PoseUploadPayload | null>(null);
   const previewFrameCounterRef = useRef(0);
+  const validPoseStreakRef = useRef(0);
+  const invalidPoseStreakRef = useRef(0);
   const lastPoseSeenAtRef = useRef(0);
   const latestFrameResolutionRef = useRef<[number, number] | null>(null);
   const latestFrameMirroredRef = useRef(false);
@@ -179,10 +204,10 @@ export function usePoseRecorder(config: RecorderConfig): {
 
   useEffect(() => {
     const interval = setInterval(() => {
-      if (latestKeypoints && Date.now() - lastPoseSeenAtRef.current > 1200) {
+      if (latestKeypoints && Date.now() - lastPoseSeenAtRef.current > STALE_POSE_CLEAR_MS) {
         setLatestKeypoints(null);
       }
-    }, 800);
+    }, STALE_CHECK_INTERVAL_MS);
 
     return () => clearInterval(interval);
   }, [latestKeypoints]);
@@ -215,7 +240,7 @@ export function usePoseRecorder(config: RecorderConfig): {
       frameIsMirroredRaw: boolean
     ) => {
       const nowMs = Date.now();
-      lastPoseSeenAtRef.current = nowMs;
+      const likelyHumanPose = isLikelyHumanPose(keypoints);
       const frameResolution = normalizeResolution(frameWidthRaw, frameHeightRaw);
 
       if (frameResolution) {
@@ -235,8 +260,25 @@ export function usePoseRecorder(config: RecorderConfig): {
         setLatestFrameMirrored(frameIsMirrored);
       }
 
+      if (!likelyHumanPose) {
+        validPoseStreakRef.current = 0;
+        previewFrameCounterRef.current = 0;
+        invalidPoseStreakRef.current += 1;
+        if (invalidPoseStreakRef.current >= MAX_INVALID_POSE_STREAK) {
+          setLatestKeypoints(null);
+        }
+        return;
+      }
+
+      validPoseStreakRef.current += 1;
+      invalidPoseStreakRef.current = 0;
+      if (validPoseStreakRef.current < MIN_VALID_POSE_STREAK) {
+        return;
+      }
+
+      lastPoseSeenAtRef.current = nowMs;
       previewFrameCounterRef.current += 1;
-      if (previewFrameCounterRef.current % 3 === 0) {
+      if (previewFrameCounterRef.current % PREVIEW_EMIT_EVERY_N_VALID_FRAMES === 0) {
         setLatestKeypoints(keypoints);
       }
 
@@ -244,7 +286,11 @@ export function usePoseRecorder(config: RecorderConfig): {
         return;
       }
 
-      const timestampMs = normalizeTimestampMs(timestampRaw, nowMs);
+      let timestampMs = normalizeTimestampMs(timestampRaw, nowMs);
+      const previousTs = lastTimestampRef.current;
+      if (previousTs !== null && timestampMs <= previousTs) {
+        timestampMs = Math.max(nowMs, previousTs + 1);
+      }
 
       if (startTimestampRef.current === null) {
         startTimestampRef.current = timestampMs;
@@ -254,7 +300,6 @@ export function usePoseRecorder(config: RecorderConfig): {
         setRecordingResolution(frameResolution);
       }
 
-      const previousTs = lastTimestampRef.current;
       if (previousTs !== null) {
         const delta = timestampMs - previousTs;
         if (delta > 0) {
@@ -344,6 +389,8 @@ export function usePoseRecorder(config: RecorderConfig): {
     droppedFrameRef.current = 0;
     stoppedPayloadRef.current = null;
     recordingResolutionRef.current = null;
+    validPoseStreakRef.current = 0;
+    invalidPoseStreakRef.current = 0;
 
     setLastError(null);
     setLastUpload(null);
@@ -432,6 +479,10 @@ export function usePoseRecorder(config: RecorderConfig): {
     emaDeltaRef.current = null;
     droppedFrameRef.current = 0;
     recordingResolutionRef.current = null;
+    validPoseStreakRef.current = 0;
+    invalidPoseStreakRef.current = 0;
+    previewFrameCounterRef.current = 0;
+    lastPoseSeenAtRef.current = 0;
 
     setIsRecording(false);
     setHasStoppedRecording(false);
