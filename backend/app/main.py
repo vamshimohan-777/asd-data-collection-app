@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import contextlib
+from .supabase_db import push_metadata_to_supabase, upload_file_to_supabase
 
 from .landmarks25 import (
     CUSTOM_25_CSV_COLUMNS,
@@ -43,7 +45,13 @@ for folder in [
 ]:
     folder.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Pose Capture Backend", version="0.1.0")
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    yield
+    # Shutdown
+
+app = FastAPI(title="Pose Capture Backend", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,7 +81,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/upload")
-def upload_capture(payload: UploadPayload) -> dict[str, object]:
+async def upload_capture(payload: UploadPayload) -> dict[str, object]:
     capture_id = _capture_id(payload.meta.session_id)
     raw_json_path = RAW_JSON_DIR / f"{capture_id}.json"
     raw_pth_path = RAW_PTH_DIR / f"{capture_id}.pth"
@@ -185,6 +193,33 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Render failed: {exc}") from exc
+
+
+    # Supabase Integration (Parallel)
+    try:
+        storage_paths = {}
+        # Upload key files to Supabase Storage
+        # Map: local_path -> remote_name
+        files_to_upload = {
+            render_path: f"{capture_id}/skeleton.mp4",
+            processed_25_csv_path: f"{capture_id}/data_25.csv",
+        }
+
+        for local_p, remote_n in files_to_upload.items():
+            public_url = await upload_file_to_supabase(local_p, remote_n)
+            if public_url:
+                storage_paths[remote_n.split("/")[-1]] = public_url
+
+        # Push metadata to Supabase Table
+        supabase_payload = {
+            "capture_id": capture_id,
+            "meta": conversion_meta,
+            "storage_paths": storage_paths
+        }
+        await push_metadata_to_supabase(supabase_payload)
+        print(f"Capture {capture_id} data pushed to Supabase.")
+    except Exception as exc:
+        print(f"Failed to push to Supabase: {exc}")
 
     return {
         "status": "ok",

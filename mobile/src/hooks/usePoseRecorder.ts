@@ -21,6 +21,7 @@ import {
   saveCaptureForPendingUpload,
   saveCaptureToLocalArchive
 } from "../utils/storage";
+import { supabase } from "../utils/supabase";
 
 interface RecorderConfig {
   backendUrl: string;
@@ -42,6 +43,12 @@ interface RecorderStats {
 
 interface StopRecordingOptions {
   uploadToBackend?: boolean;
+  uploadToSupabase?: boolean; // New option
+  metaOverride?: {
+    session_id?: string;
+    age?: number;
+    gender?: PoseCaptureMeta["gender"];
+  };
 }
 
 interface StopForReviewResult {
@@ -76,6 +83,49 @@ const MAX_INVALID_POSE_STREAK = 1;
 const PREVIEW_EMIT_EVERY_N_VALID_FRAMES = 2;
 const STALE_POSE_CLEAR_MS = 300;
 const STALE_CHECK_INTERVAL_MS = 120;
+
+async function uploadToSupabaseDirect(
+  payload: PoseUploadPayload,
+  captureId: string
+): Promise<boolean> {
+  try {
+    const fileName = `${captureId}/raw_capture.json`;
+    const jsonStr = JSON.stringify(payload);
+
+    // 1. Upload JSON file to Storage
+    const { error: storageError } = await supabase.storage
+      .from("pose-captures")
+      .upload(fileName, jsonStr, {
+        contentType: "application/json",
+        upsert: true
+      });
+
+    if (storageError) {
+      console.warn("Supabase storage upload error:", storageError.message);
+      return false;
+    }
+
+    // 2. Insert metadata record into DB
+    const { error: dbError } = await supabase.from("captures").insert({
+      capture_id: captureId,
+      meta: payload.meta,
+      storage_paths: {
+        raw_json: fileName
+      },
+      source: "mobile_direct"
+    });
+
+    if (dbError) {
+      console.warn("Supabase DB insert error:", dbError.message);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error("Supabase direct upload exception:", err);
+    return false;
+  }
+}
 
 function normalizeTimestampMs(rawValue: number, fallbackMs: number): number {
   if (!Number.isFinite(rawValue) || rawValue <= 0) {
@@ -147,6 +197,7 @@ export function usePoseRecorder(config: RecorderConfig): {
   discardStoppedRecording: () => void;
   stopRecording: (options?: StopRecordingOptions) => Promise<StopRecordingResult>;
   syncPendingUploads: () => Promise<SyncPendingResult>;
+  isSyncingToSupabase: boolean; // Expose status
 } {
   const configRef = useRef(config);
   const recordingRef = useRef(false);
@@ -185,6 +236,7 @@ export function usePoseRecorder(config: RecorderConfig): {
   const [lastUpload, setLastUpload] = useState<PoseUploadResponse | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [pendingUploadsCount, setPendingUploadsCount] = useState(0);
+  const [isSyncingToSupabase, setIsSyncingToSupabase] = useState(false);
 
   useEffect(() => {
     configRef.current = config;
@@ -430,7 +482,17 @@ export function usePoseRecorder(config: RecorderConfig): {
   const commitStoppedRecording = useCallback(
     async (options?: StopRecordingOptions): Promise<StopRecordingResult> => {
       const shouldUpload = options?.uploadToBackend ?? true;
-      const payload = stoppedPayloadRef.current ?? buildPayloadFromCurrentSamples();
+      let payload = stoppedPayloadRef.current ?? buildPayloadFromCurrentSamples();
+
+      if (options?.metaOverride) {
+        payload = {
+          ...payload,
+          meta: {
+            ...payload.meta,
+            ...options.metaOverride
+          }
+        };
+      }
       stoppedPayloadRef.current = payload;
 
       const localCapture = await saveCaptureToLocalArchive(payload);
@@ -444,12 +506,36 @@ export function usePoseRecorder(config: RecorderConfig): {
           uploadResult = await uploadCapture(payload, configRef.current.backendUrl);
           setLastUpload(uploadResult);
           setLastError(null);
+
+          // Default sync provided user didn't explicitly disable it
+          if (options?.uploadToSupabase !== false) {
+            setIsSyncingToSupabase(true);
+            const captureIdForSupabase =
+              uploadResult.capture_id || `mobile_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+            uploadToSupabaseDirect(payload, captureIdForSupabase)
+              .catch((err) => {
+                console.warn("Background Supabase sync failed:", err);
+              })
+              .finally(() => setIsSyncingToSupabase(false));
+          }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           setLastError(message);
           await saveCaptureForPendingUpload(payload);
         } finally {
           setIsUploading(false);
+        }
+      } else if (options?.uploadToSupabase) {
+        // Direct to Supabase ONLY
+        setIsSyncingToSupabase(true);
+        const captureIdForSupabase = `mobile_direct_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+        try {
+          await uploadToSupabaseDirect(payload, captureIdForSupabase);
+          setLastError(null);
+        } catch (err) {
+          setLastError("Direct Supabase sync failed");
+        } finally {
+          setIsSyncingToSupabase(false);
         }
       } else {
         await saveCaptureForPendingUpload(payload);
@@ -523,6 +609,13 @@ export function usePoseRecorder(config: RecorderConfig): {
           await removePendingCapture(captureId);
           lastUploadResult = result;
           uploaded += 1;
+
+          // Parallel Direct Supabase Sync
+          const captureIdForSupabase =
+            result.capture_id || `mobile_sync_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+          uploadToSupabaseDirect(payload, captureIdForSupabase).catch((err) => {
+            console.warn("Background Supabase sync failed during retry:", err);
+          });
         } catch (error) {
           failed += 1;
           lastSyncError = error instanceof Error ? error.message : String(error);
@@ -569,6 +662,7 @@ export function usePoseRecorder(config: RecorderConfig): {
     commitStoppedRecording,
     discardStoppedRecording,
     stopRecording,
-    syncPendingUploads
+    syncPendingUploads,
+    isSyncingToSupabase
   };
 }

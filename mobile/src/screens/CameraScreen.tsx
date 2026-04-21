@@ -146,6 +146,7 @@ export function CameraScreen(): React.ReactElement {
   const [reviewInfo, setReviewInfo] = useState<ReviewInfo | null>(null);
   const [isFinalizing, setIsFinalizing] = useState(false);
   const [isReadinessStable, setIsReadinessStable] = useState(false);
+  const [syncToSupabase, setSyncToSupabase] = useState(true);
 
   const cameraRef = useRef<Camera>(null);
   const pulse = useSharedValue(1);
@@ -411,10 +412,18 @@ export function CameraScreen(): React.ReactElement {
   };
 
   const finalizeStoppedRecording = useCallback(
-    async (uploadToBackend: boolean): Promise<void> => {
+    async (uploadToBackend: boolean, uploadToSupabase: boolean): Promise<void> => {
       setIsFinalizing(true);
       try {
-        const result = await recorder.commitStoppedRecording({ uploadToBackend });
+        const result = await recorder.commitStoppedRecording({
+          uploadToBackend,
+          uploadToSupabase,
+          metaOverride: {
+            session_id: sessionId.trim() || undefined,
+            age: participantAge,
+            gender: participantGender
+          }
+        });
         const uploadSucceeded = Boolean(result.upload);
         const summary = summarizeSaveResult(
           uploadToBackend,
@@ -673,6 +682,9 @@ export function CameraScreen(): React.ReactElement {
         <Text style={styles.subtle}>
           Pending local uploads: {recorder.pendingUploadsCount}
         </Text>
+        <Text style={styles.subtle}>
+          Supabase Status: {recorder.isSyncingToSupabase ? "Syncing..." : "Ready"}
+        </Text>
         {recorder.lastError ? <Text style={styles.errorText}>{recorder.lastError}</Text> : null}
       </View>
 
@@ -754,8 +766,9 @@ export function CameraScreen(): React.ReactElement {
   );
 
   const renderConfirmStep = (): React.ReactElement => (
-    <View style={[styles.screen, styles.confirmContainer]}>
+    <ScrollView contentContainerStyle={[styles.homeContainer, styles.confirmContainer]}>
       <Text style={styles.homeTitle}>Confirm Capture</Text>
+
       <View style={styles.rulesCard}>
         <Text style={styles.cardTitle}>Recording Summary</Text>
         <Text style={styles.subtle}>
@@ -769,22 +782,115 @@ export function CameraScreen(): React.ReactElement {
         </Text>
       </View>
 
+      <View style={styles.configCard}>
+        <Text style={styles.cardTitle}>Refine Metadata</Text>
+        <Text style={styles.subtleSmall}>You can adjust these before the final upload.</Text>
+
+        <View style={styles.spaceTopSmall}>
+          <Text style={styles.inputLabel}>Session ID</Text>
+          <TextInput
+            value={sessionId}
+            onChangeText={setSessionId}
+            placeholder="Optional session id"
+            placeholderTextColor="#6A7380"
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.input}
+          />
+        </View>
+
+        <View style={styles.spaceTopSmall}>
+          <Text style={styles.inputLabel}>Participant Age</Text>
+          <TextInput
+            value={participantAgeInput}
+            onChangeText={setParticipantAgeInput}
+            placeholder="Participant age (required)"
+            placeholderTextColor="#6A7380"
+            keyboardType="number-pad"
+            maxLength={3}
+            style={styles.input}
+          />
+          {participantAge === undefined ? (
+            <Text style={styles.errorText}>Age must be a number between 1 and 120.</Text>
+          ) : null}
+        </View>
+
+        <View style={styles.inlineRow}>
+          <Text style={styles.subtle}>Also sync to Supabase</Text>
+          <Pressable
+            style={[styles.genderChip, syncToSupabase && styles.genderChipSelected]}
+            onPress={() => setSyncToSupabase((p) => !p)}
+          >
+            <Text style={styles.genderChipText}>{syncToSupabase ? "ON" : "OFF"}</Text>
+          </Pressable>
+        </View>
+
+        <Text style={[styles.subtle, styles.genderLabel]}>Gender</Text>
+        <View style={styles.genderGrid}>
+          {GENDER_OPTIONS.map((option) => {
+            const isSelected = participantGender === option.value;
+            return (
+              <Pressable
+                key={option.value}
+                style={[styles.genderChip, isSelected && styles.genderChipSelected]}
+                onPress={() => setParticipantGender(option.value)}
+              >
+                <Text
+                  style={[
+                    styles.genderChipText,
+                    isSelected && styles.genderChipTextSelected
+                  ]}
+                >
+                  {option.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      </View>
+
       {!recorder.hasStoppedRecording ? (
-        <Text style={styles.errorText}>No stopped recording is available. Please capture again.</Text>
+        <Text style={styles.errorText}>
+          No stopped recording is available. Please capture again.
+        </Text>
       ) : null}
 
       <Pressable
-        style={[styles.primaryButton, (!recorder.hasStoppedRecording || isFinalizing) && styles.disabledButton]}
-        onPress={() => finalizeStoppedRecording(true)}
-        disabled={!recorder.hasStoppedRecording || isFinalizing}
+        style={[
+          styles.primaryButton,
+          (!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined) &&
+            styles.disabledButton
+        ]}
+        onPress={() => finalizeStoppedRecording(true, syncToSupabase)}
+        disabled={!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined}
       >
-        <Text style={styles.primaryButtonText}>Save and Send to Backend</Text>
+        <Text style={styles.primaryButtonText}>
+          {syncToSupabase ? "Save and Send to Backend + Supabase" : "Save and Send to Backend"}
+        </Text>
       </Pressable>
 
       <Pressable
-        style={[styles.secondaryButton, (!recorder.hasStoppedRecording || isFinalizing) && styles.disabledButton, styles.spaceTop]}
+        style={[
+          styles.secondaryButton,
+          (!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined) &&
+            styles.disabledButton,
+          styles.spaceTop
+        ]}
+        onPress={() => finalizeStoppedRecording(false, true)}
+        disabled={!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined}
+      >
+        <Text style={styles.secondaryButtonText}>Save and Send to Supabase ONLY</Text>
+      </Pressable>
+
+      <Pressable
+        style={[
+          styles.secondaryButton,
+          (!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined) &&
+            styles.disabledButton,
+          styles.spaceTop
+        ]}
         onPress={() => finalizeStoppedRecording(false)}
-        disabled={!recorder.hasStoppedRecording || isFinalizing}
+        disabled={!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined}
       >
         <Text style={styles.secondaryButtonText}>Save Locally Only</Text>
       </Pressable>
@@ -796,7 +902,7 @@ export function CameraScreen(): React.ReactElement {
       >
         <Text style={styles.secondaryButtonText}>Discard Capture</Text>
       </Pressable>
-    </View>
+    </ScrollView>
   );
 
   if (flowStep === "home") {
@@ -992,6 +1098,20 @@ const styles = StyleSheet.create({
   },
   spaceTop: {
     marginTop: 10
+  },
+  spaceTopSmall: {
+    marginTop: 8
+  },
+  inputLabel: {
+    color: "#2F4E63",
+    fontSize: 12,
+    fontWeight: "700",
+    marginBottom: 0
+  },
+  subtleSmall: {
+    color: "#6A7380",
+    fontSize: 11,
+    marginTop: 2
   },
   previewWrapper: {
     flex: 1
