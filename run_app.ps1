@@ -51,7 +51,12 @@ function Remove-PathIfExists {
 
     if (Test-Path -LiteralPath $Path) {
         Write-Host "Removing $Path" -ForegroundColor DarkYellow
-        Remove-Item -LiteralPath $Path -Recurse -Force
+        if ($env:OS -eq "Windows_NT" -and (Test-Path -LiteralPath $Path -PathType Container)) {
+            cmd /c rd /s /q "`"$Path`""
+        }
+        else {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        }
     }
 }
 
@@ -60,7 +65,6 @@ function Get-VenvPython {
 
     $isWindowsHost = ($env:OS -eq "Windows_NT")
     if ($isWindowsHost) {
-        # On Windows we explicitly prefer the standard venv layout.
         $candidates = @(
             (Join-Path $VenvDir "Scripts\\python.exe"),
             (Join-Path $VenvDir "Scripts\\python"),
@@ -79,9 +83,20 @@ function Get-VenvPython {
         )
     }
 
-    return $candidates | Where-Object {
+    $found = $candidates | Where-Object {
         Test-Path -LiteralPath $_
     } | Select-Object -First 1
+
+    if ($found) {
+        # A valid venv must have a pyvenv.cfg in its root
+        $configPath = Join-Path $VenvDir "pyvenv.cfg"
+        if (-not (Test-Path -LiteralPath $configPath)) {
+            Write-Host "Warning: Found Python at $found but missing pyvenv.cfg at $VenvDir. Treating as invalid venv." -ForegroundColor Yellow
+            return $null
+        }
+    }
+
+    return $found
 }
 
 function Get-RequirementPackageNames {
@@ -792,8 +807,13 @@ function Ensure-VenvPython {
 
     function Get-PythonMajorMinor {
         param([Parameter(Mandatory = $true)][string]$Exe)
-        $version = (& $Exe -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null | Out-String).Trim()
-        return $version
+        try {
+            $version = (& $Exe -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null | Out-String).Trim()
+            return $version
+        }
+        catch {
+            return $null
+        }
     }
 
     $venvDir = Join-Path $BackendDir ".venv"
@@ -803,8 +823,8 @@ function Ensure-VenvPython {
 
         $targetVersion = Get-PythonMajorMinor -Exe $PythonForVenv
         $existingVersion = Get-PythonMajorMinor -Exe $existing
-        if ($targetVersion -and $existingVersion -and $targetVersion -ne $existingVersion) {
-            Write-Host "Existing venv Python ($existingVersion) differs from selected Python ($targetVersion). Recreating..." -ForegroundColor Yellow
+        if (-not $existingVersion -or ($targetVersion -and $targetVersion -ne $existingVersion)) {
+            Write-Host "Existing venv is invalid or Python version differs. Recreating..." -ForegroundColor Yellow
             $reuse = $false
         }
 
@@ -823,7 +843,7 @@ function Ensure-VenvPython {
 
     if (Test-Path -LiteralPath $venvDir) {
         Write-Host "Found incomplete virtualenv. Recreating..." -ForegroundColor Yellow
-        Remove-Item -LiteralPath $venvDir -Recurse -Force
+        Remove-PathIfExists -Path $venvDir
     }
 
     Write-Host "Creating backend virtualenv..." -ForegroundColor Cyan
@@ -910,13 +930,56 @@ function Get-JavaHomeInfo {
         }
     }
 
-    Add-JavaCandidate -Path $env:JAVA_HOME
-    Add-JavaCandidate -Path "$env:ProgramFiles\Android\Android Studio\jbr"
-    Add-JavaCandidate -Path "$env:ProgramFiles\Android\Android Studio\jre"
+    if ($env:JAVA_HOME) {
+        Add-JavaCandidate -Path $env:JAVA_HOME
+    }
 
+    # Add common Java 17 paths and toolchain directories
+    if ($env:ProgramFiles) {
+        Add-JavaCandidate -Path (Join-Path $env:ProgramFiles "Java\jdk-17")
+        $javaRoot = Join-Path $env:ProgramFiles "Java"
+        if (Test-Path $javaRoot) {
+            Get-ChildItem -Path $javaRoot -Directory | ForEach-Object { Add-JavaCandidate -Path $_.FullName }
+        }
+    }
+
+    if ($env:USERPROFILE) {
+        $gradleJdks = Join-Path $env:USERPROFILE ".gradle\jdks"
+        if (Test-Path $gradleJdks) {
+            Get-ChildItem -Path $gradleJdks -Directory | ForEach-Object { Add-JavaCandidate -Path $_.FullName }
+        }
+    }
+
+    if ($env:ProgramFiles) {
+        Add-JavaCandidate -Path "$env:ProgramFiles\Android\Android Studio\jbr"
+        Add-JavaCandidate -Path "$env:ProgramFiles\Android\Android Studio\jre"
+    }
+
+    # 1. Search for a preferred Java 17 specifically
     foreach ($javaHome in $javaCandidates) {
         $javaExe = Join-Path $javaHome "bin\java.exe"
         if (Test-Path -LiteralPath $javaExe) {
+            try {
+                $versionOutput = (& $javaExe -version 2>&1 | Out-String)
+                if ($versionOutput -like "*version `"17.*`"*") {
+                    Write-Host "Using Java 17 at: $javaHome" -ForegroundColor Green
+                    return @{
+                        Home = $javaHome
+                        JavaExe = $javaExe
+                    }
+                }
+            }
+            catch {
+                # Ignore version check failures for individual candidates
+            }
+        }
+    }
+
+    # 2. Fallback to the first viable candidate (even if not 17)
+    foreach ($javaHome in $javaCandidates) {
+        $javaExe = Join-Path $javaHome "bin\java.exe"
+        if (Test-Path -LiteralPath $javaExe) {
+            Write-Host "Using fallback Java at: $javaHome" -ForegroundColor Yellow
             return @{
                 Home = $javaHome
                 JavaExe = $javaExe
@@ -928,25 +991,34 @@ function Get-JavaHomeInfo {
 }
 
 function Ensure-AndroidGradleArchitectures {
-    param([Parameter(Mandatory = $true)][string]$MobileDir)
-
+    param([string]$MobileDir)
     $gradlePropsPath = Join-Path $MobileDir "android\gradle.properties"
-    if (-not (Test-Path -LiteralPath $gradlePropsPath)) {
-        Write-Host "Android gradle.properties not found yet (skip architecture patch)." -ForegroundColor DarkYellow
-        return
-    }
+    if (-not (Test-Path -LiteralPath $gradlePropsPath)) { return }
 
     $content = Get-Content -LiteralPath $gradlePropsPath -Raw
-    $desiredLine = "reactNativeArchitectures=arm64-v8a,x86_64"
-    $updated = [regex]::Replace(
-        $content,
-        "(?m)^reactNativeArchitectures=.*$",
-        $desiredLine
-    )
+    $updated = [regex]::Replace($content, '(?m)^reactNativeArchitectures=.*$', 'reactNativeArchitectures=arm64-v8a,x86_64')
+    
+    # Add or update android.ndkVersion
+    $sdkRoot = Join-Path $env:USERPROFILE "AppData\Local\Android\Sdk"
+    if ($env:ANDROID_HOME) { $sdkRoot = $env:ANDROID_HOME }
+    
+    $ndkDir = Join-Path $sdkRoot "ndk"
+    if (Test-Path $ndkDir) {
+        $bestNdk = Get-ChildItem -Path $ndkDir -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if ($bestNdk) {
+            $ndkVer = $bestNdk.Name
+            if (-not $updated.Contains("android.ndkVersion")) {
+                $updated += "`nandroid.ndkVersion=$ndkVer"
+            }
+            else {
+                $updated = [regex]::Replace($updated, '(?m)^android\.ndkVersion=.*$', "android.ndkVersion=$ndkVer")
+            }
+        }
+    }
 
     if ($updated -ne $content) {
         Set-Content -LiteralPath $gradlePropsPath -Value $updated -NoNewline
-        Write-Host "Patched Android architectures to arm64-v8a,x86_64." -ForegroundColor Cyan
+        Write-Host "Patched android/gradle.properties (architectures and ndkVersion)." -ForegroundColor Cyan
     }
 }
 
@@ -1033,6 +1105,32 @@ if (-not $SkipInstall) {
     }
 }
 
+# Automatically generate local.properties for Gradle
+if ($runPlatform -eq "android" -and $androidSdkInfo -and $androidSdkInfo.Root) {
+    $androidFolder = Join-Path $mobileDir "android"
+    if (Test-Path -LiteralPath $androidFolder) {
+        $localPropsPath = Join-Path $androidFolder "local.properties"
+        $sdkPath = $androidSdkInfo.Root.Replace('\', '\\')
+        $propsContent = "sdk.dir=$sdkPath`n"
+        
+        # ndk.dir is deprecated; we will now handle it via gradle.properties instead.
+        
+        if (-not (Test-Path -LiteralPath $localPropsPath)) {
+            Set-Content -LiteralPath $localPropsPath -Value $propsContent
+            Write-Host "Generated local.properties with SDK path." -ForegroundColor Cyan
+        }
+        else {
+            # Clean up existing local.properties to remove deprecated ndk.dir
+            $existing = Get-Content -LiteralPath $localPropsPath -Raw
+            if ($existing -like "*ndk.dir*") {
+                $cleaned = [regex]::Replace($existing, '(?m)^ndk\.dir=.*(\r?\n)?', "")
+                Set-Content -LiteralPath $localPropsPath -Value $cleaned -NoNewline
+                Write-Host "Cleaned up deprecated ndk.dir from local.properties." -ForegroundColor Cyan
+            }
+        }
+    }
+}
+
 if ($runPlatform -eq "android") {
     Ensure-AndroidGradleArchitectures -MobileDir $mobileDir
 }
@@ -1058,7 +1156,7 @@ Write-Host "Backend Python: $venvPython" -ForegroundColor DarkGray
 Write-Host "Starting backend on http://$BackendHost`:$BackendPort ..." -ForegroundColor Green
 $backendCommand = @"
 Set-Location -LiteralPath '$backendDir'
-& '$venvPython' -m uvicorn app.main:app --reload --host $BackendHost --port $BackendPort
+& '$venvPython' -m uvicorn app.main:app --reload --reload-dir app --host $BackendHost --port $BackendPort
 "@
 Start-DetachedPowerShell -Command $backendCommand -Title "Pose Backend"
 

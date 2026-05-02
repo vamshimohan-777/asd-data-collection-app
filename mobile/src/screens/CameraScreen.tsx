@@ -38,6 +38,11 @@ import {
 } from "../pose/blazePoseWorklet";
 import type { ParticipantGender } from "../types/pose";
 import { evaluateCaptureReadiness } from "../utils/quality";
+import { supabase } from "../utils/supabase";
+
+const SUPABASE_URL = 'https://pvnxallyisjavbqmcpbs.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB2bnhhbGx5aXNqYXZicW1jcGJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDAwODMsImV4cCI6MjA5MjMxNjA4M30.hf4EB5TphSdr9q_UO4MncxBvcq2_f9YZiKvnEgagO5o';
+
 
 type CaptureFlowStep = "home" | "testing" | "recording" | "confirm";
 
@@ -133,7 +138,6 @@ export function CameraScreen(): React.ReactElement {
 
   const [flowStep, setFlowStep] = useState<CaptureFlowStep>("home");
   const [cameraFacing, setCameraFacing] = useState<CameraPosition>("back");
-  const [backendUrl, setBackendUrl] = useState(DEFAULT_BACKEND_URL);
   const [sessionId, setSessionId] = useState("");
   const [participantAgeInput, setParticipantAgeInput] = useState("");
   const [participantGender, setParticipantGender] =
@@ -146,6 +150,7 @@ export function CameraScreen(): React.ReactElement {
   const [reviewInfo, setReviewInfo] = useState<ReviewInfo | null>(null);
   const [isFinalizing, setIsFinalizing] = useState(false);
   const [isReadinessStable, setIsReadinessStable] = useState(false);
+  const [syncToSupabase, setSyncToSupabase] = useState(true);
 
   const cameraRef = useRef<Camera>(null);
   const pulse = useSharedValue(1);
@@ -248,7 +253,6 @@ export function CameraScreen(): React.ReactElement {
   }, [participantAgeInput]);
 
   const recorder = usePoseRecorder({
-    backendUrl,
     fpsNominal: selectedFps,
     resolution:
       selectedFormatResolution[0] > 0 && selectedFormatResolution[1] > 0
@@ -411,19 +415,27 @@ export function CameraScreen(): React.ReactElement {
   };
 
   const finalizeStoppedRecording = useCallback(
-    async (uploadToBackend: boolean): Promise<void> => {
+    async (): Promise<void> => {
       setIsFinalizing(true);
       try {
-        const result = await recorder.commitStoppedRecording({ uploadToBackend });
+        const result = await recorder.commitStoppedRecording({
+          session_id: sessionId.trim() || undefined,
+          age: participantAge,
+          gender: participantGender
+        });
         const uploadSucceeded = Boolean(result.upload);
-        const summary = summarizeSaveResult(
-          uploadToBackend,
-          uploadSucceeded,
-          result.pendingUploads
-        );
+        const lastError = recorder.lastError;
+        
+        let summary = "Saved locally.";
+        if (uploadSucceeded) {
+          summary = "Saved and uploaded to Supabase successfully.";
+        } else if (lastError) {
+          summary = `Saved locally, but Supabase sync failed.\n\n[Error]: ${lastError}`;
+        }
+
         Alert.alert(
           "Capture Saved",
-          `Frames: ${result.payload.timestamps.length}\nJSON: ${result.localCapture.json_path}\nNPY: ${result.localCapture.keypoints_npy_path}\n${summary}`
+          `Frames: ${result.payload.timestamps.length}\nJSON: ${result.localCapture.json_path}\nNPY: ${result.localCapture.keypoints_npy_path}\n\n${summary}`
         );
         setReviewInfo(null);
         setFlowStep("home");
@@ -434,7 +446,7 @@ export function CameraScreen(): React.ReactElement {
         setIsFinalizing(false);
       }
     },
-    [recorder]
+    [recorder, sessionId, participantAge, participantGender]
   );
 
   const onDiscardCapture = (): void => {
@@ -453,6 +465,24 @@ export function CameraScreen(): React.ReactElement {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       Alert.alert("Sync Failed", message);
+    }
+  };
+
+  const onTestConnection = async (): Promise<void> => {
+    try {
+      const start = Date.now();
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/`, {
+        headers: { apikey: SUPABASE_ANON_KEY }
+      });
+      const duration = Date.now() - start;
+      if (response.ok || response.status === 401 || response.status === 400) {
+        Alert.alert("Cloud Connection OK", `Reached Supabase in ${duration}ms (Status: ${response.status})`);
+      } else {
+        Alert.alert("Cloud Connection Failed", `Status: ${response.status}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      Alert.alert("Cloud Connection Error", message);
     }
   };
 
@@ -580,15 +610,6 @@ export function CameraScreen(): React.ReactElement {
       <View style={styles.configCard}>
         <Text style={styles.cardTitle}>Session Setup</Text>
         <TextInput
-          value={backendUrl}
-          onChangeText={setBackendUrl}
-          placeholder="http://192.168.x.x:8000"
-          placeholderTextColor="#6A7380"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-        />
-        <TextInput
           value={sessionId}
           onChangeText={setSessionId}
           placeholder="Optional session id"
@@ -673,6 +694,9 @@ export function CameraScreen(): React.ReactElement {
         <Text style={styles.subtle}>
           Pending local uploads: {recorder.pendingUploadsCount}
         </Text>
+        <Text style={styles.subtle}>
+          Supabase Status: {recorder.isSyncingToSupabase ? "Syncing..." : "Ready"}
+        </Text>
         {recorder.lastError ? <Text style={styles.errorText}>{recorder.lastError}</Text> : null}
       </View>
 
@@ -687,15 +711,22 @@ export function CameraScreen(): React.ReactElement {
       <Pressable
         style={[
           styles.secondaryButton,
-          (recorder.pendingUploadsCount < 1 || recorder.isUploading) && styles.disabledButton,
+          (recorder.pendingUploadsCount < 1 || recorder.isSyncingToSupabase) && styles.disabledButton,
           styles.spaceTop
         ]}
         onPress={onSyncPending}
-        disabled={recorder.pendingUploadsCount < 1 || recorder.isUploading}
+        disabled={recorder.pendingUploadsCount < 1 || recorder.isSyncingToSupabase}
       >
         <Text style={styles.secondaryButtonText}>
           Sync Pending ({recorder.pendingUploadsCount})
         </Text>
+      </Pressable>
+
+      <Pressable
+        style={[styles.secondaryButton, styles.spaceTop]}
+        onPress={onTestConnection}
+      >
+        <Text style={styles.secondaryButtonText}>Test Cloud Connection</Text>
       </Pressable>
     </ScrollView>
   );
@@ -754,8 +785,9 @@ export function CameraScreen(): React.ReactElement {
   );
 
   const renderConfirmStep = (): React.ReactElement => (
-    <View style={[styles.screen, styles.confirmContainer]}>
+    <ScrollView contentContainerStyle={[styles.homeContainer, styles.confirmContainer]}>
       <Text style={styles.homeTitle}>Confirm Capture</Text>
+
       <View style={styles.rulesCard}>
         <Text style={styles.cardTitle}>Recording Summary</Text>
         <Text style={styles.subtle}>
@@ -769,24 +801,91 @@ export function CameraScreen(): React.ReactElement {
         </Text>
       </View>
 
+      <View style={styles.configCard}>
+        <Text style={styles.cardTitle}>Refine Metadata</Text>
+        <Text style={styles.subtleSmall}>You can adjust these before the final upload.</Text>
+
+        <View style={styles.spaceTopSmall}>
+          <Text style={styles.inputLabel}>Session ID</Text>
+          <TextInput
+            value={sessionId}
+            onChangeText={setSessionId}
+            placeholder="Optional session id"
+            placeholderTextColor="#6A7380"
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.input}
+          />
+        </View>
+
+        <View style={styles.spaceTopSmall}>
+          <Text style={styles.inputLabel}>Participant Age</Text>
+          <TextInput
+            value={participantAgeInput}
+            onChangeText={setParticipantAgeInput}
+            placeholder="Participant age (required)"
+            placeholderTextColor="#6A7380"
+            keyboardType="number-pad"
+            maxLength={3}
+            style={styles.input}
+          />
+          {participantAge === undefined ? (
+            <Text style={styles.errorText}>Age must be a number between 1 and 120.</Text>
+          ) : null}
+        </View>
+
+        <View style={styles.inlineRow}>
+          <Text style={styles.subtle}>Also sync to Supabase</Text>
+          <Pressable
+            style={[styles.genderChip, syncToSupabase && styles.genderChipSelected]}
+            onPress={() => setSyncToSupabase((p) => !p)}
+          >
+            <Text style={styles.genderChipText}>{syncToSupabase ? "ON" : "OFF"}</Text>
+          </Pressable>
+        </View>
+
+        <Text style={[styles.subtle, styles.genderLabel]}>Gender</Text>
+        <View style={styles.genderGrid}>
+          {GENDER_OPTIONS.map((option) => {
+            const isSelected = participantGender === option.value;
+            return (
+              <Pressable
+                key={option.value}
+                style={[styles.genderChip, isSelected && styles.genderChipSelected]}
+                onPress={() => setParticipantGender(option.value)}
+              >
+                <Text
+                  style={[
+                    styles.genderChipText,
+                    isSelected && styles.genderChipTextSelected
+                  ]}
+                >
+                  {option.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      </View>
+
       {!recorder.hasStoppedRecording ? (
-        <Text style={styles.errorText}>No stopped recording is available. Please capture again.</Text>
+        <Text style={styles.errorText}>
+          No stopped recording is available. Please capture again.
+        </Text>
       ) : null}
 
       <Pressable
-        style={[styles.primaryButton, (!recorder.hasStoppedRecording || isFinalizing) && styles.disabledButton]}
-        onPress={() => finalizeStoppedRecording(true)}
-        disabled={!recorder.hasStoppedRecording || isFinalizing}
+        style={[
+          styles.primaryButton,
+          (!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined) &&
+            styles.disabledButton
+        ]}
+        onPress={() => finalizeStoppedRecording()}
+        disabled={!recorder.hasStoppedRecording || isFinalizing || participantAge === undefined}
       >
-        <Text style={styles.primaryButtonText}>Save and Send to Backend</Text>
-      </Pressable>
-
-      <Pressable
-        style={[styles.secondaryButton, (!recorder.hasStoppedRecording || isFinalizing) && styles.disabledButton, styles.spaceTop]}
-        onPress={() => finalizeStoppedRecording(false)}
-        disabled={!recorder.hasStoppedRecording || isFinalizing}
-      >
-        <Text style={styles.secondaryButtonText}>Save Locally Only</Text>
+        <Text style={styles.primaryButtonText}>
+          Save and Send to Supabase Cloud
+        </Text>
       </Pressable>
 
       <Pressable
@@ -796,7 +895,7 @@ export function CameraScreen(): React.ReactElement {
       >
         <Text style={styles.secondaryButtonText}>Discard Capture</Text>
       </Pressable>
-    </View>
+    </ScrollView>
   );
 
   if (flowStep === "home") {
@@ -992,6 +1091,20 @@ const styles = StyleSheet.create({
   },
   spaceTop: {
     marginTop: 10
+  },
+  spaceTopSmall: {
+    marginTop: 8
+  },
+  inputLabel: {
+    color: "#2F4E63",
+    fontSize: 12,
+    fontWeight: "700",
+    marginBottom: 0
+  },
+  subtleSmall: {
+    color: "#6A7380",
+    fontSize: 11,
+    marginTop: 2
   },
   previewWrapper: {
     flex: 1

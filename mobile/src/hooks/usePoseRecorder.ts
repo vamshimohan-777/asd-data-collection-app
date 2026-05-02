@@ -9,10 +9,9 @@ import type {
   PoseFrameSample,
   PoseKeypoint,
   PoseUploadPayload,
-  PoseUploadResponse
+  PoseUploadResponse,
+  PoseCaptureMetadata
 } from "../types/pose";
-import { uploadCapture } from "../utils/api";
-import { isLikelyHumanPose } from "../utils/quality";
 import {
   countPendingCaptures,
   listPendingCaptureIds,
@@ -21,9 +20,9 @@ import {
   saveCaptureForPendingUpload,
   saveCaptureToLocalArchive
 } from "../utils/storage";
+import { supabase } from "../utils/supabase";
 
 interface RecorderConfig {
-  backendUrl: string;
   fpsNominal: number;
   resolution: [number, number];
   cameraFacing: "front" | "back";
@@ -41,7 +40,11 @@ interface RecorderStats {
 }
 
 interface StopRecordingOptions {
-  uploadToBackend?: boolean;
+  metaOverride?: {
+    session_id?: string;
+    age?: number;
+    gender?: PoseCaptureMeta["gender"];
+  };
 }
 
 interface StopForReviewResult {
@@ -54,7 +57,6 @@ interface StopRecordingResult {
   payload: PoseUploadPayload;
   localCapture: LocalCapturePaths;
   upload?: PoseUploadResponse;
-  keptLocal: boolean;
   pendingUploads: number;
 }
 
@@ -77,13 +79,52 @@ const PREVIEW_EMIT_EVERY_N_VALID_FRAMES = 2;
 const STALE_POSE_CLEAR_MS = 300;
 const STALE_CHECK_INTERVAL_MS = 120;
 
+async function uploadToSupabaseDirect(
+  payload: PoseUploadPayload,
+  captureId: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const fileName = `${captureId}/raw_capture.json`;
+    const jsonStr = JSON.stringify(payload);
+
+    const binaryData = new Uint8Array(unescape(encodeURIComponent(jsonStr)).split('').map(c => c.charCodeAt(0)));
+
+    const { error: storageError } = await supabase.storage
+      .from("pose-captures")
+      .upload(fileName, binaryData, {
+        contentType: "application/json",
+        upsert: true,
+        cacheControl: '3600'
+      });
+
+    if (storageError) {
+      return { success: false, error: `Storage: ${storageError.message}` };
+    }
+
+    const { error: dbError } = await supabase.from("captures").insert({
+      capture_id: captureId,
+      meta: payload.meta,
+      storage_paths: {
+        raw_json: fileName
+      }
+    });
+
+    if (dbError) {
+      return { success: false, error: `DB: ${dbError.message}` };
+    }
+
+    return { success: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: msg };
+  }
+}
+
 function normalizeTimestampMs(rawValue: number, fallbackMs: number): number {
   if (!Number.isFinite(rawValue) || rawValue <= 0) {
     return fallbackMs;
   }
 
-  // VisionCamera timestamps can be seconds/ms/us/ns depending on platform/runtime.
-  // Prefer whichever conversion is close to wall-clock time; otherwise fall back to Date.now().
   const candidates = [
     rawValue,
     rawValue / 1e3,
@@ -127,7 +168,6 @@ function normalizeResolution(
 export function usePoseRecorder(config: RecorderConfig): {
   frameProcessor: ReturnType<typeof useFrameProcessor>;
   isRecording: boolean;
-  isUploading: boolean;
   hasStoppedRecording: boolean;
   stoppedRecordingFrames: number;
   stats: RecorderStats;
@@ -136,17 +176,17 @@ export function usePoseRecorder(config: RecorderConfig): {
   latestFrameMirrored: boolean;
   recordingResolution: [number, number] | null;
   lastJsonPath: string | null;
-  lastUpload: PoseUploadResponse | null;
   lastError: string | null;
   pendingUploadsCount: number;
   startRecording: () => void;
   stopRecordingForReview: () => Promise<StopForReviewResult>;
   commitStoppedRecording: (
-    options?: StopRecordingOptions
+    metaOverride?: Partial<PoseCaptureMetadata>
   ) => Promise<StopRecordingResult>;
   discardStoppedRecording: () => void;
-  stopRecording: (options?: StopRecordingOptions) => Promise<StopRecordingResult>;
+  stopRecording: (metaOverride?: Partial<PoseCaptureMetadata>) => Promise<StopRecordingResult>;
   syncPendingUploads: () => Promise<SyncPendingResult>;
+  isSyncingToSupabase: boolean;
 } {
   const configRef = useRef(config);
   const recordingRef = useRef(false);
@@ -165,7 +205,6 @@ export function usePoseRecorder(config: RecorderConfig): {
   const recordingResolutionRef = useRef<[number, number] | null>(null);
 
   const [isRecording, setIsRecording] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
   const [hasStoppedRecording, setHasStoppedRecording] = useState(false);
   const [stoppedRecordingFrames, setStoppedRecordingFrames] = useState(0);
   const [stats, setStats] = useState<RecorderStats>(EMPTY_STATS);
@@ -182,9 +221,9 @@ export function usePoseRecorder(config: RecorderConfig): {
     number
   ] | null>(null);
   const [lastJsonPath, setLastJsonPath] = useState<string | null>(null);
-  const [lastUpload, setLastUpload] = useState<PoseUploadResponse | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [pendingUploadsCount, setPendingUploadsCount] = useState(0);
+  const [isSyncingToSupabase, setIsSyncingToSupabase] = useState(false);
 
   useEffect(() => {
     configRef.current = config;
@@ -197,9 +236,7 @@ export function usePoseRecorder(config: RecorderConfig): {
   }, []);
 
   useEffect(() => {
-    refreshPendingCount().catch(() => {
-      // Non-fatal. The queue count will refresh on next save/upload.
-    });
+    refreshPendingCount().catch(() => {});
   }, [refreshPendingCount]);
 
   useEffect(() => {
@@ -240,7 +277,6 @@ export function usePoseRecorder(config: RecorderConfig): {
       frameIsMirroredRaw: boolean
     ) => {
       const nowMs = Date.now();
-      const likelyHumanPose = isLikelyHumanPose(keypoints);
       const frameResolution = normalizeResolution(frameWidthRaw, frameHeightRaw);
 
       if (frameResolution) {
@@ -258,16 +294,6 @@ export function usePoseRecorder(config: RecorderConfig): {
       if (latestFrameMirroredRef.current !== frameIsMirrored) {
         latestFrameMirroredRef.current = frameIsMirrored;
         setLatestFrameMirrored(frameIsMirrored);
-      }
-
-      if (!likelyHumanPose) {
-        validPoseStreakRef.current = 0;
-        previewFrameCounterRef.current = 0;
-        invalidPoseStreakRef.current += 1;
-        if (invalidPoseStreakRef.current >= MAX_INVALID_POSE_STREAK) {
-          setLatestKeypoints(null);
-        }
-        return;
       }
 
       validPoseStreakRef.current += 1;
@@ -393,8 +419,6 @@ export function usePoseRecorder(config: RecorderConfig): {
     invalidPoseStreakRef.current = 0;
 
     setLastError(null);
-    setLastUpload(null);
-    setLastJsonPath(null);
     setHasStoppedRecording(false);
     setStoppedRecordingFrames(0);
     setRecordingResolution(null);
@@ -428,46 +452,67 @@ export function usePoseRecorder(config: RecorderConfig): {
   );
 
   const commitStoppedRecording = useCallback(
-    async (options?: StopRecordingOptions): Promise<StopRecordingResult> => {
-      const shouldUpload = options?.uploadToBackend ?? true;
-      const payload = stoppedPayloadRef.current ?? buildPayloadFromCurrentSamples();
-      stoppedPayloadRef.current = payload;
-
-      const localCapture = await saveCaptureToLocalArchive(payload);
-      setLastJsonPath(localCapture.json_path);
-
-      let uploadResult: PoseUploadResponse | undefined;
-
-      if (shouldUpload) {
-        setIsUploading(true);
-        try {
-          uploadResult = await uploadCapture(payload, configRef.current.backendUrl);
-          setLastUpload(uploadResult);
-          setLastError(null);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          setLastError(message);
-          await saveCaptureForPendingUpload(payload);
-        } finally {
-          setIsUploading(false);
-        }
-      } else {
-        await saveCaptureForPendingUpload(payload);
+    async (
+      metaOverride?: Partial<PoseCaptureMetadata>
+    ): Promise<StopRecordingResult> => {
+      if (!stoppedPayloadRef.current) {
+        throw new Error("No stopped recording to commit.");
       }
 
-      const pendingUploads = await refreshPendingCount();
+      const payload = {
+        ...stoppedPayloadRef.current,
+        meta: {
+          ...stoppedPayloadRef.current.meta,
+          ...metaOverride
+        }
+      };
+
       stoppedPayloadRef.current = null;
       setHasStoppedRecording(false);
       setStoppedRecordingFrames(0);
-      return {
-        payload,
-        localCapture,
-        upload: uploadResult,
-        keptLocal: true,
-        pendingUploads
-      };
+
+      const localCapture = await saveCaptureToLocalArchive(payload);
+      setLastJsonPath(localCapture.json_path);
+      
+      setIsSyncingToSupabase(true);
+      const captureId = `mobile_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+      
+      try {
+        const res = await uploadToSupabaseDirect(payload, captureId);
+        if (res.success) {
+          setLastError(null);
+          const pendingCount = await refreshPendingCount();
+          return {
+            payload,
+            localCapture,
+            pendingUploads: pendingCount,
+            upload: { status: "ok", capture_id: captureId } as any
+          };
+        } else {
+          setLastError(`Supabase Error: ${res.error}`);
+          await saveCaptureForPendingUpload(payload);
+          const pendingCount = await refreshPendingCount();
+          return {
+            payload,
+            localCapture,
+            pendingUploads: pendingCount
+          };
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setLastError(`Network Exception: ${msg}`);
+        await saveCaptureForPendingUpload(payload);
+        const pendingCount = await refreshPendingCount();
+        return {
+          payload,
+          localCapture,
+          pendingUploads: pendingCount
+        };
+      } finally {
+        setIsSyncingToSupabase(false);
+      }
     },
-    [buildPayloadFromCurrentSamples, refreshPendingCount]
+    [refreshPendingCount]
   );
 
   const discardStoppedRecording = useCallback(() => {
@@ -494,49 +539,50 @@ export function usePoseRecorder(config: RecorderConfig): {
   const stopRecording = useCallback(
     async (options?: StopRecordingOptions): Promise<StopRecordingResult> => {
       await stopRecordingForReview();
-      return commitStoppedRecording(options);
+      return commitStoppedRecording(options?.metaOverride);
     },
     [commitStoppedRecording, stopRecordingForReview]
   );
 
   const syncPendingUploads = useCallback(async (): Promise<SyncPendingResult> => {
     const ids = await listPendingCaptureIds();
-    if (ids.length === 0) {
-      return {
-        uploaded: 0,
-        failed: 0,
-        remaining: 0
-      };
-    }
-
     let uploaded = 0;
     let failed = 0;
-    let lastUploadResult: PoseUploadResponse | null = null;
     let lastSyncError: string | null = null;
 
-    setIsUploading(true);
+    setIsSyncingToSupabase(true);
     try {
       for (const captureId of ids) {
+        let payload;
+
         try {
-          const payload = await loadPendingCapturePayload(captureId);
-          const result = await uploadCapture(payload, configRef.current.backendUrl);
-          await removePendingCapture(captureId);
-          lastUploadResult = result;
-          uploaded += 1;
-        } catch (error) {
+          payload = await loadPendingCapturePayload(captureId);
+        } catch (err) {
           failed += 1;
-          lastSyncError = error instanceof Error ? error.message : String(error);
+          continue;
+        }
+
+        try {
+          const tempId = `mobile_sync_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+          const res = await uploadToSupabaseDirect(payload, tempId);
+          if (res.success) {
+            await removePendingCapture(captureId);
+            uploaded += 1;
+          } else {
+            failed += 1;
+            lastSyncError = res.error || "Supabase Error";
+          }
+        } catch (err) {
+          failed += 1;
+          lastSyncError = err instanceof Error ? err.message : String(err);
         }
       }
     } finally {
-      setIsUploading(false);
+      setIsSyncingToSupabase(false);
     }
 
-    if (lastUploadResult) {
-      setLastUpload(lastUploadResult);
-    }
     if (lastSyncError) {
-      setLastError(lastSyncError);
+      setLastError(`Sync failed: ${lastSyncError}`);
     } else if (uploaded > 0) {
       setLastError(null);
     }
@@ -552,7 +598,6 @@ export function usePoseRecorder(config: RecorderConfig): {
   return {
     frameProcessor,
     isRecording,
-    isUploading,
     hasStoppedRecording,
     stoppedRecordingFrames,
     stats,
@@ -561,7 +606,6 @@ export function usePoseRecorder(config: RecorderConfig): {
     latestFrameMirrored,
     recordingResolution,
     lastJsonPath,
-    lastUpload,
     lastError,
     pendingUploadsCount,
     startRecording,
@@ -569,6 +613,7 @@ export function usePoseRecorder(config: RecorderConfig): {
     commitStoppedRecording,
     discardStoppedRecording,
     stopRecording,
-    syncPendingUploads
+    syncPendingUploads,
+    isSyncingToSupabase
   };
 }
