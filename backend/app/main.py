@@ -31,6 +31,7 @@ RENDER_DIR = DATA_DIR / "renders"
 PROCESSED_25_CSV_DIR = DATA_DIR / "processed_25_csv"
 PROCESSED_25_NPY_DIR = DATA_DIR / "processed_25_npy"
 PROCESSED_25_META_DIR = DATA_DIR / "processed_25_meta"
+PROCESSED_33_NPY_DIR = DATA_DIR / "processed_33_npy"
 
 for folder in [
     RAW_JSON_DIR,
@@ -40,6 +41,7 @@ for folder in [
     PROCESSED_25_CSV_DIR,
     PROCESSED_25_NPY_DIR,
     PROCESSED_25_META_DIR,
+    PROCESSED_33_NPY_DIR,
 ]:
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -82,6 +84,7 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
     processed_25_csv_path = PROCESSED_25_CSV_DIR / f"{capture_id}.csv"
     processed_25_npy_path = PROCESSED_25_NPY_DIR / f"{capture_id}.npy"
     processed_25_meta_path = PROCESSED_25_META_DIR / f"{capture_id}.json"
+    processed_33_npy_path = PROCESSED_33_NPY_DIR / f"{capture_id}.npy"
 
     try:
         keypoints_np = np.asarray(payload.keypoints, dtype=np.float32)
@@ -127,6 +130,9 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
         keypoints_25_flat = flatten_custom_25_for_csv(keypoints_25)
 
         np.save(processed_25_npy_path, keypoints_25.astype(np.float32))
+        # Save the full 33-landmark Screening-Compatible format
+        np.save(processed_33_npy_path, processed.keypoints.astype(np.float32))
+        
         np.savetxt(
             processed_25_csv_path,
             keypoints_25_flat,
@@ -195,6 +201,7 @@ def upload_capture(payload: UploadPayload) -> dict[str, object]:
         "render_path": str(render_path),
         "processed_25_csv_path": str(processed_25_csv_path),
         "processed_25_npy_path": str(processed_25_npy_path),
+        "processed_33_npy_path": str(processed_33_npy_path),
         "processed_25_meta_path": str(processed_25_meta_path),
         "frames_in": int(keypoints_np.shape[0]),
         "frames_out": int(processed.keypoints.shape[0]),

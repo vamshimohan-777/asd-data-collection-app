@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,109 @@ def interpolate_missing_keypoints(
     return out
 
 
+class SpatialProcessor:
+    """
+    Implementation of the Screening App's SpatialSkeletonProcessor.
+    Standardizes 33-landmark skeletons to be orientation-invariant and scale-normalized.
+    """
+    def __init__(self, confidence_threshold=0.5, smooth_window=5, poly_order=2):
+        self.confidence_threshold = confidence_threshold
+        self.smooth_window = smooth_window
+        self.poly_order = poly_order
+        
+        # Keypoint Indices
+        self.L_HIP = 23
+        self.R_HIP = 24
+        self.L_SHOULDER = 11
+        self.R_SHOULDER = 12
+
+    def process_sequence(self, landmarks, vis_mask):
+        """Full pipeline: from raw landmarks to canonical 3D skeleton sequence."""
+        # 1. Missing Joints Handling (Interpolation)
+        landmarks = self.handle_missing_joints(landmarks, vis_mask)
+        
+        # 2. Root Centering
+        landmarks = self.center_root(landmarks)
+        
+        # 3. Orientation Alignment and Scale Normalization
+        landmarks = self.align_orientation_and_scale(landmarks)
+        
+        # 4. Temporal Smoothing
+        landmarks = self.smooth_trajectory(landmarks)
+        
+        return landmarks
+
+    def handle_missing_joints(self, landmarks, vis_mask):
+        """Mask out low confidence joints and interpolate missing values."""
+        landmarks = landmarks.copy()
+        bad_joints = vis_mask < self.confidence_threshold
+        landmarks[bad_joints] = np.nan
+        
+        T, num_joints, dims = landmarks.shape
+        flattened = landmarks.reshape(T, -1)
+        df = pd.DataFrame(flattened)
+        df = df.interpolate(method='linear', limit_direction='both')
+        df = df.fillna(0)
+        return df.values.reshape(T, num_joints, dims)
+
+    def center_root(self, landmarks):
+        """Center the skeleton at the pelvis for every frame."""
+        L_hip = landmarks[:, self.L_HIP, :]
+        R_hip = landmarks[:, self.R_HIP, :]
+        root = (L_hip + R_hip) / 2.0
+        return landmarks - root[:, np.newaxis, :]
+
+    def align_orientation_and_scale(self, landmarks):
+        """Standardize orientation (XY rotation) and scale (torso length)."""
+        T = landmarks.shape[0]
+        if T == 0: return landmarks
+
+        # 1. 2D VERTICAL ALIGNMENT (XY PLANE)
+        L_hip = landmarks[:, self.L_HIP, :2]
+        R_hip = landmarks[:, self.R_HIP, :2]
+        root_2d = (L_hip + R_hip) / 2.0
+        
+        L_shoulder = landmarks[:, self.L_SHOULDER, :2]
+        R_shoulder = landmarks[:, self.R_SHOULDER, :2]
+        shoulder_center_2d = (L_shoulder + R_shoulder) / 2.0
+        
+        torso_vec_2d = np.mean(shoulder_center_2d - root_2d, axis=0)
+        current_angle = np.arctan2(torso_vec_2d[1], torso_vec_2d[0])
+        target_angle = -np.pi / 2.0 # -90 degrees is up
+        d_theta = target_angle - current_angle
+        
+        cos_tr, sin_tr = np.cos(d_theta), np.sin(d_theta)
+        R_xy = np.array([[cos_tr, -sin_tr], [sin_tr, cos_tr]])
+        landmarks[:, :, :2] = np.matmul(landmarks[:, :, :2], R_xy.T)
+        
+        # 2. SCALE NORMALIZATION (3D)
+        L_hip_3d = landmarks[:, self.L_HIP, :]
+        R_hip_3d = landmarks[:, self.R_HIP, :]
+        root_3d = (L_hip_3d + R_hip_3d) / 2.0
+        
+        L_shoulder_3d = landmarks[:, self.L_SHOULDER, :]
+        R_shoulder_3d = landmarks[:, self.R_SHOULDER, :]
+        shoulder_center_3d = (L_shoulder_3d + R_shoulder_3d) / 2.0
+        
+        torso_lengths = np.linalg.norm(shoulder_center_3d - root_3d, axis=1)
+        torso_length = np.median(torso_lengths)
+        
+        if torso_length > 1e-5:
+            landmarks = landmarks / torso_length
+            
+        return landmarks
+
+    def smooth_trajectory(self, landmarks):
+        """Apply Savitzky-Golay filter to smooth joint trajectories."""
+        T = landmarks.shape[0]
+        if T > self.smooth_window:
+            window = self.smooth_window if self.smooth_window % 2 == 1 else self.smooth_window + 1
+            if window > T: window = T if T % 2 == 1 else T - 1
+            if window > self.poly_order:
+                landmarks = savgol_filter(landmarks, window, self.poly_order, axis=0)
+        return landmarks
+
+
 def preprocess_pose_capture(
     keypoints: np.ndarray,
     timestamps: np.ndarray,
@@ -195,26 +300,30 @@ def preprocess_pose_capture(
     timestamp_scale_to_ms = infer_timestamp_scale_to_ms(timestamps_np, config.target_fps)
     timestamps_ms = timestamps_np * timestamp_scale_to_ms
 
+    # 1. Resample to target FPS
     resampled_keypoints, resampled_timestamps = resample_keypoints(
         keypoints_np, timestamps_ms, config.target_fps
     )
-    smoothed_keypoints = exponential_smoothing(resampled_keypoints, config.smoothing_alpha)
-    normalized_keypoints = normalize_skeleton(smoothed_keypoints)
-    filled_keypoints = interpolate_missing_keypoints(
-        normalized_keypoints, config.visibility_threshold
-    )
+    
+    # 2. Apply Screening-Compatible Spatial Processing (33 landmarks)
+    # Extract [T, 33, 3] and visibility [T, 33]
+    coords = resampled_keypoints[:, :, :3]
+    visibility = resampled_keypoints[:, :, 3]
+    
+    processor = SpatialProcessor(visibility_threshold=config.visibility_threshold)
+    processed_33 = processor.process_sequence(coords, visibility)
 
     processing_meta: dict[str, float | int] = {
         "frames_in": int(keypoints_np.shape[0]),
-        "frames_out": int(filled_keypoints.shape[0]),
+        "frames_out": int(processed_33.shape[0]),
         "target_fps": float(config.target_fps),
-        "smoothing_alpha": float(config.smoothing_alpha),
         "visibility_threshold": float(config.visibility_threshold),
         "timestamp_scale_to_ms": float(timestamp_scale_to_ms),
+        "processor": "SpatialProcessor_33_v1"
     }
 
     return PipelineResult(
-        keypoints=filled_keypoints,
+        keypoints=processed_33,
         timestamps=resampled_timestamps,
         processing_meta=processing_meta
     )
